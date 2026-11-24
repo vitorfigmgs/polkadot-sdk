@@ -513,14 +513,17 @@ fn clearing_during_a_staged_migration_removes_unmigrated_entries_too() {
 }
 
 #[test]
-fn clearing_a_map_during_a_staged_migration_leaves_other_maps_alone() {
-	let log = Log::scenario("one map of a partly migrated pallet is cleared");
+fn draining_a_map_during_a_staged_migration_leaves_other_maps_alone() {
+	let log = Log::scenario("one map of a partly migrated pallet is drained");
 	TestExternalities::new_empty().execute_with(|| {
 		LegacyBonded::insert(1, 1);
 		LegacyLedger::insert(1, 1);
 		Bonded::insert(2, 2);
 
-		Bonded::clear(None);
+		let drained: Vec<_> = Bonded::drain().collect();
+
+		log.it("should yield the entries the map already holds in its child trie");
+		assert_eq!(drained, vec![(2, 2)]);
 
 		log.it("should remove that map's migrated and unmigrated entries");
 		assert_eq!(Bonded::iter().count(), 0);
