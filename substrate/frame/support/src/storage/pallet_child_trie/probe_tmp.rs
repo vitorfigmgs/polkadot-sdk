@@ -43,7 +43,11 @@ fn probe_clear_limit_on_overlay() {
 	TestExternalities::new_empty().execute_with(|| {
 		(0..10u64).for_each(|i| L::insert(i, i));
 		let r = clear_pallet_child_trie(b"P", Some(1));
-		println!("PROBE overlay clear Some(1): {:?}, remaining {}", r, L::iter().count());
+		println!(
+			"PROBE overlay clear Some(1): all_removed={}, remaining {}",
+			matches!(r, sp_io::KillStorageResult::AllRemoved(_)),
+			L::iter().count()
+		);
 	});
 }
 
