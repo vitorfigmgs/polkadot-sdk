@@ -44,12 +44,14 @@ All items are exported from `frame_support::storage::pallet_child_trie`. `Prefix
 
 ### Free functions
 
+In each, `pallet_name` is the pallet's name as a byte slice (`&[u8]`), e.g. `b"Staking"`, the same string `PalletInfoAccess::name()` returns.
+
 - **`pallet_child_trie_is_empty(pallet_name)`**: reports whether the pallet's child trie holds no data.
 - **`clear_pallet_child_trie(pallet_name, limit)`**: deletes the pallet's data, including entries not yet migrated. `None` deletes everything; `Some(n)` deletes at most `n` entries. Returns `sp_io::KillStorageResult`.
 - **`migrate_pallet_to_child_trie(pallet_name, limit)`**: moves the pallet's main-trie data into its child trie. `None` moves everything; `Some(n)` moves at most `n` entries. Returns `MigrationProgress`.
 - **`pending_legacy_entries(pallet_name)`**: returns how many of the pallet's main-trie entries are still waiting to be migrated.
 
-`OptionQuery`, `ValueQuery`, and the existing hashers (e.g. `Blake2_128Concat`, `Twox64Concat`) must work. Each method and function behaves like its same-named counterpart on `StorageValue` / `StorageMap`.
+`OptionQuery`, `ValueQuery`, and the existing hashers (e.g. `Blake2_128Concat`, `Twox64Concat`) must work. Each method listed above behaves like its same-named counterpart on `StorageValue` / `StorageMap`. The free functions have no such counterpart; their behavior is defined below.
 
 ## Requirements
 
@@ -92,10 +94,10 @@ All items are exported from `frame_support::storage::pallet_child_trie`. `Prefix
 24. Running the migration after completion returns `{moved:0, skipped:0, complete:true}` and leaves the state root unchanged. The same applies to a pallet that never stored anything, whose child trie stays empty.
 25. `pending_legacy_entries` counts the pallet's remaining main-trie entries, excluding the storage version: 6 after migrating 4 of 10, and 0 when complete.
 26. While a migration is only partly done, deleting an entry through the new types (`kill`, `remove`, `take`, or a `mutate` to `None`) also deletes its not yet migrated copy, so a later migration step never brings it back.
-27. While a migration is only partly done, `clear_pallet_child_trie` and a map's `clear` also delete the not yet migrated entries (of the pallet, or of that map), but never the storage version. Other maps' entries are still migrated afterwards.
-28. `MigrateToPalletChildTrie::<Pallet, DbWeight>::on_runtime_upgrade()` fully migrates the pallet named `Pallet::name()` (as in 18) and returns a weight with `ref_time` at least `DbWeight.write × entries moved` and a non-zero `proof_size`.
-29. With `Limit = Some(n)`, one `on_runtime_upgrade()` run moves at most `n` entries. Running it again continues, and repeated runs move every entry without loss.
+27. While a migration is only partly done, `clear_pallet_child_trie` also deletes the pallet's not yet migrated entries, but never the storage version. Likewise a map's `drain()` also deletes that map's not yet migrated entries (without yielding them). Other maps' entries are still migrated afterwards.
+28. Until a migration completes, reads through the new types are only guaranteed to see entries already in the child trie. Entries not yet migrated may not be visible.
+29. `MigrateToPalletChildTrie::<Pallet, DbWeight>::on_runtime_upgrade()` fully migrates the pallet named `Pallet::name()` (as in 18) and returns a weight with `ref_time` at least `DbWeight.write × entries moved` and a non-zero `proof_size`.
+30. With `Limit = Some(n)`, one `on_runtime_upgrade()` run moves at most `n` entries. Running it again continues, and repeated runs move every entry without loss.
 
 ## Out of scope
 - `#[pallet::storage]` macro integration and metadata changes.
-- Change tries.
