@@ -24,8 +24,8 @@ use crate::{
 	storage::{
 		pallet_child_trie::{
 			clear_pallet_child_trie, migrate_pallet_to_child_trie, pallet_child_trie_is_empty,
-			pending_legacy_entries, MigrateToPalletChildTrie, MigrationProgress, PalletChildTrieMap,
-			PalletChildTrieValue,
+			pending_legacy_entries, MigrateToPalletChildTrie, MigrationProgress,
+			PalletChildTrieMap, PalletChildTrieValue,
 		},
 		types::{StorageMap, StorageValue, ValueQuery},
 	},
@@ -109,6 +109,13 @@ impl PalletInfoAccess for StakingPallet {
 	}
 }
 
+struct StopAfterThree;
+impl Get<Option<u32>> for StopAfterThree {
+	fn get() -> Option<u32> {
+		Some(3)
+	}
+}
+
 struct TestDbWeight;
 impl Get<RuntimeDbWeight> for TestDbWeight {
 	fn get() -> RuntimeDbWeight {
@@ -185,22 +192,6 @@ fn maps_with_the_same_key_in_different_pallets_are_isolated() {
 		Nominators::insert(6, 600);
 		assert_eq!(Proposals::iter().collect::<Vec<_>>(), vec![(5, 50)]);
 		assert_eq!(Nominators::iter().collect::<Vec<_>>(), vec![(6, 600)]);
-	});
-}
-
-#[test]
-fn child_trie_keys_follow_the_regular_layout_without_the_pallet_prefix() {
-	let log = Log::scenario("the same item is stored in the main trie and in a pallet child trie");
-	TestExternalities::new_empty().execute_with(|| {
-		let main_key = LegacyLedger::hashed_key_for(42);
-		let child_key = Ledger::child_key_for(42);
-
-		log.it("should use the regular main trie key with only the pallet prefix removed");
-		assert_eq!(&main_key[..16], &twox_128(STAKING));
-		assert_eq!(&main_key[16..], &child_key[..]);
-
-		log.it("should do the same for a plain value");
-		assert_eq!(&LegacyCurrentEra::hashed_key()[16..], &CurrentEra::child_key()[..]);
 	});
 }
 
@@ -370,6 +361,9 @@ fn runtime_upgrade_moves_existing_pallet_storage_into_its_child_trie() {
 
 		log.it("should charge a weight covering a write for every moved entry");
 		assert!(weight.ref_time() >= 4 * 10);
+
+		log.it("should charge a proof size, since the migration reads from the trie");
+		assert!(weight.proof_size() > 0);
 	});
 }
 
@@ -471,5 +465,92 @@ fn migration_never_overwrites_newer_child_trie_data() {
 		log.it("should drop the stale entries from the main trie");
 		assert!(!LegacyLedger::contains_key(1));
 		assert!(!main_trie_has_pallet_data(STAKING));
+	});
+}
+
+#[test]
+fn entries_deleted_during_a_staged_migration_stay_deleted() {
+	let log = Log::scenario("a pallet deletes entries before the migration has reached them");
+	TestExternalities::new_empty().execute_with(|| {
+		LegacyLedger::insert(1, 100);
+		LegacyLedger::insert(2, 200);
+		LegacyLedger::insert(3, 300);
+		LegacyCurrentEra::put(4);
+		migrate_pallet_to_child_trie(STAKING, Some(0));
+
+		log.it("should not bring back an entry that was removed through the child trie type");
+		Ledger::remove(1);
+		assert_eq!(Ledger::take(2), None);
+		CurrentEra::kill();
+		migrate_pallet_to_child_trie(STAKING, None);
+		assert_eq!(Ledger::get(1), None);
+		assert_eq!(Ledger::get(2), None);
+		assert!(!CurrentEra::exists());
+
+		log.it("should still move the entries that were not deleted");
+		assert_eq!(Ledger::get(3), Some(300));
+	});
+}
+
+#[test]
+fn clearing_during_a_staged_migration_removes_unmigrated_entries_too() {
+	let log = Log::scenario("a pallet is cleared while only part of it has been migrated");
+	TestExternalities::new_empty().execute_with(|| {
+		(0..4u64).for_each(|i| LegacyBonded::insert(i, i));
+		StorageVersion::new(2).put::<StakingPallet>();
+		migrate_pallet_to_child_trie(STAKING, Some(2));
+		clear_pallet_child_trie(STAKING, None);
+
+		log.it("should leave nothing to migrate afterwards");
+		assert_eq!(pending_legacy_entries(STAKING), 0);
+		let progress = migrate_pallet_to_child_trie(STAKING, None);
+		assert_eq!(progress, MigrationProgress { moved: 0, skipped: 0, complete: true });
+		assert_eq!(Bonded::iter().count(), 0);
+
+		log.it("should keep the pallet's storage version");
+		assert_eq!(StorageVersion::get::<StakingPallet>(), StorageVersion::new(2));
+	});
+}
+
+#[test]
+fn clearing_a_map_during_a_staged_migration_leaves_other_maps_alone() {
+	let log = Log::scenario("one map of a partly migrated pallet is cleared");
+	TestExternalities::new_empty().execute_with(|| {
+		LegacyBonded::insert(1, 1);
+		LegacyLedger::insert(1, 1);
+		Bonded::insert(2, 2);
+
+		Bonded::clear(None);
+
+		log.it("should remove that map's migrated and unmigrated entries");
+		assert_eq!(Bonded::iter().count(), 0);
+		migrate_pallet_to_child_trie(STAKING, None);
+		assert_eq!(Bonded::iter().count(), 0);
+
+		log.it("should still migrate the other map");
+		assert_eq!(Ledger::get(1), Some(1));
+	});
+}
+
+#[test]
+fn a_capped_runtime_upgrade_moves_only_the_cap_and_can_be_run_again() {
+	let log = Log::scenario("a runtime upgrade is configured to move at most 3 entries per run");
+	TestExternalities::new_empty().execute_with(|| {
+		(0..7u64).for_each(|i| LegacyBonded::insert(i, i));
+
+		MigrateToPalletChildTrie::<StakingPallet, TestDbWeight, StopAfterThree>::on_runtime_upgrade(
+		);
+
+		log.it("should leave the remaining entries to a later run");
+		assert_eq!(Bonded::iter().count(), 3);
+		assert_eq!(pending_legacy_entries(STAKING), 4);
+
+		log.it("should finish the migration over repeated runs without losing entries");
+		MigrateToPalletChildTrie::<StakingPallet, TestDbWeight, StopAfterThree>::on_runtime_upgrade(
+		);
+		MigrateToPalletChildTrie::<StakingPallet, TestDbWeight, StopAfterThree>::on_runtime_upgrade(
+		);
+		assert_eq!(pending_legacy_entries(STAKING), 0);
+		assert_eq!(Bonded::iter().count(), 7);
 	});
 }

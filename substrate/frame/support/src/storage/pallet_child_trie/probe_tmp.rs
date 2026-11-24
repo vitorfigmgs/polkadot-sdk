@@ -79,7 +79,7 @@ fn probe_value_migrated_across_commits() {
 		ext.commit_all().unwrap();
 		calls += 1;
 		if p.complete {
-			break
+			break;
 		}
 	}
 	ext.execute_with(|| {
@@ -96,11 +96,7 @@ fn probe_bare_prefix_key() {
 	TestExternalities::new_empty().execute_with(|| {
 		unhashed::put_raw(&twox_128(b"P"), &[7u8]);
 		let p = migrate_pallet_to_child_trie(b"P", None);
-		println!(
-			"PROBE bare prefix: {:?}, empty={}",
-			p,
-			pallet_child_trie_is_empty(b"P")
-		);
+		println!("PROBE bare prefix: {:?}, empty={}", p, pallet_child_trie_is_empty(b"P"));
 	});
 }
 

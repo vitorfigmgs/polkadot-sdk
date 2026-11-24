@@ -98,14 +98,18 @@ fn pallet_child_info(pallet_prefix: &[u8]) -> ChildInfo {
 	ChildInfo::new_default(&pallet_child_trie_storage_key(pallet_prefix))
 }
 
-/// Remove up to `limit` keys of the child trie of the pallet named `pallet_prefix`.
+/// Remove up to `limit` entries of the pallet named `pallet_prefix`.
 ///
-/// `None` removes everything. Keys written in the current block (the overlay) are always
-/// removed and do not count toward `limit`. When the result is
+/// `None` removes everything. Entries of the pallet that were not migrated yet (still in the main
+/// trie, except the storage version) are removed too, and count toward `limit`, so that a later
+/// migration step cannot bring them back. Entries written in the current block (the overlay) are
+/// always removed and do not count toward `limit`. When the result is
 /// [`KillStorageResult::SomeRemaining`], call again (typically in a later block) to continue.
 pub fn clear_pallet_child_trie(pallet_prefix: &[u8], limit: Option<u32>) -> KillStorageResult {
 	let child_info = pallet_child_info(pallet_prefix);
-	sp_io::default_child_storage::storage_kill(child_info.storage_key(), limit)
+	kill_with_legacy(pallet_prefix, &[], limit, |child_limit| {
+		sp_io::default_child_storage::storage_kill(child_info.storage_key(), child_limit)
+	})
 }
 
 /// Whether the child trie of the pallet named `pallet_prefix` holds any key.
@@ -122,6 +126,57 @@ fn item_key(storage_prefix: &str, suffix: &[u8]) -> Vec<u8> {
 	key.extend_from_slice(&twox_128(storage_prefix.as_bytes()));
 	key.extend_from_slice(suffix);
 	key
+}
+
+/// Remove the not yet migrated copy of the child trie key `child_key`, so that a later migration
+/// step cannot bring back an entry that was deleted through the child trie types.
+fn kill_legacy_key(pallet_prefix: &str, child_key: &[u8]) {
+	let mut key = twox_128(pallet_prefix.as_bytes()).to_vec();
+	key.extend_from_slice(child_key);
+	unhashed::kill(&key);
+}
+
+/// Remove not yet migrated main trie entries whose child trie key starts with `item_prefix`, never
+/// the storage version. Returns how many were removed and whether more remain because of `limit`.
+fn kill_legacy_prefix(pallet_prefix: &[u8], item_prefix: &[u8], limit: Option<u32>) -> (u32, bool) {
+	let mut prefix = twox_128(pallet_prefix).to_vec();
+	prefix.extend_from_slice(item_prefix);
+	let version_key = storage_version_key(pallet_prefix);
+	let mut removed = 0u32;
+	let mut next = next_key_with_prefix(&prefix, &prefix, true);
+	while let Some(key) = next {
+		if key != version_key {
+			if limit.map_or(false, |l| removed >= l) {
+				return (removed, true);
+			}
+			unhashed::kill(&key);
+			removed = removed.saturating_add(1);
+		}
+		next = next_key_with_prefix(&prefix, &key, false);
+	}
+	(removed, false)
+}
+
+/// Remove up to `limit` entries below `item_prefix`, from the main trie first and then from the
+/// child trie through `kill_child`, which receives the part of the limit left over.
+fn kill_with_legacy(
+	pallet_prefix: &[u8],
+	item_prefix: &[u8],
+	limit: Option<u32>,
+	kill_child: impl FnOnce(Option<u32>) -> KillStorageResult,
+) -> KillStorageResult {
+	let (removed, remaining) = kill_legacy_prefix(pallet_prefix, item_prefix, limit);
+	if remaining {
+		return KillStorageResult::SomeRemaining(removed);
+	}
+	match kill_child(limit.map(|l| l.saturating_sub(removed))) {
+		KillStorageResult::AllRemoved(n) => {
+			KillStorageResult::AllRemoved(n.saturating_add(removed))
+		},
+		KillStorageResult::SomeRemaining(n) => {
+			KillStorageResult::SomeRemaining(n.saturating_add(removed))
+		},
+	}
 }
 
 /// A storage value kept in the child trie of its pallet.
@@ -177,17 +232,18 @@ where
 		}
 	}
 
-	/// Remove the value.
+	/// Remove the value, including a not yet migrated copy of it.
 	pub fn kill() {
-		child::kill(&Self::child_info(), &Self::child_key())
+		child::kill(&Self::child_info(), &Self::child_key());
+		kill_legacy_key(Prefix::pallet_prefix(), &Self::child_key());
 	}
 
-	/// Remove the value and return what was stored.
+	/// Remove the value, including a not yet migrated copy of it, and return what was stored in
+	/// the child trie.
 	pub fn take() -> QueryKind::Query {
-		QueryKind::from_optional_value_to_query(child::take(
-			&Self::child_info(),
-			&Self::child_key(),
-		))
+		let value = child::take(&Self::child_info(), &Self::child_key());
+		kill_legacy_key(Prefix::pallet_prefix(), &Self::child_key());
+		QueryKind::from_optional_value_to_query(value)
 	}
 
 	/// Mutate the value.
@@ -247,6 +303,12 @@ where
 		})
 	}
 
+	/// Remove the entry at the child trie key `child_key`, including a not yet migrated copy.
+	fn kill_entry(child_key: &[u8]) {
+		child::kill(&Self::child_info(), child_key);
+		kill_legacy_key(Prefix::pallet_prefix(), child_key);
+	}
+
 	/// Whether an entry is explicitly stored for `key`.
 	pub fn contains_key<KeyArg: EncodeLike<Key>>(key: KeyArg) -> bool {
 		child::exists(&Self::child_info(), &Self::child_key_for(key))
@@ -275,21 +337,22 @@ where
 		let child_key = Self::child_key_for(key);
 		match QueryKind::from_query_to_optional_value(val) {
 			Some(v) => child::put(&Self::child_info(), &child_key, &v),
-			None => child::kill(&Self::child_info(), &child_key),
+			None => Self::kill_entry(&child_key),
 		}
 	}
 
-	/// Remove the entry at `key`.
+	/// Remove the entry at `key`, including a not yet migrated copy of it.
 	pub fn remove<KeyArg: EncodeLike<Key>>(key: KeyArg) {
-		child::kill(&Self::child_info(), &Self::child_key_for(key))
+		Self::kill_entry(&Self::child_key_for(key))
 	}
 
-	/// Remove the entry at `key` and return what was stored.
+	/// Remove the entry at `key`, including a not yet migrated copy of it, and return what was
+	/// stored in the child trie.
 	pub fn take<KeyArg: EncodeLike<Key>>(key: KeyArg) -> QueryKind::Query {
-		QueryKind::from_optional_value_to_query(child::take(
-			&Self::child_info(),
-			&Self::child_key_for(key),
-		))
+		let child_key = Self::child_key_for(key);
+		let value = child::take(&Self::child_info(), &child_key);
+		kill_legacy_key(Prefix::pallet_prefix(), &child_key);
+		QueryKind::from_optional_value_to_query(value)
 	}
 
 	/// Mutate the value at `key`.
@@ -313,19 +376,27 @@ where
 		let res = f(&mut val)?;
 		match QueryKind::from_query_to_optional_value(val) {
 			Some(v) => child::put(&Self::child_info(), &child_key, &v),
-			None => child::kill(&Self::child_info(), &child_key),
+			None => Self::kill_entry(&child_key),
 		}
 		Ok(res)
 	}
 
-	/// Remove up to `limit` entries of this map, leaving the rest of the pallet child trie
-	/// untouched. Entries written in the current block do not count toward `limit`.
+	/// Remove up to `limit` entries of this map, including its not yet migrated entries, leaving
+	/// the rest of the pallet untouched. Entries written in the current block do not count toward
+	/// `limit`.
 	pub fn clear(limit: Option<u32>) -> KillStorageResult {
 		let child_info = Self::child_info();
-		sp_io::default_child_storage::clear_prefix(
-			child_info.storage_key(),
+		kill_with_legacy(
+			Prefix::pallet_prefix().as_bytes(),
 			&Self::map_prefix(),
 			limit,
+			|child_limit| {
+				sp_io::default_child_storage::clear_prefix(
+					child_info.storage_key(),
+					&Self::map_prefix(),
+					child_limit,
+				)
+			},
 		)
 	}
 }
@@ -355,8 +426,11 @@ where
 		Self::iter().map(|(k, _)| k)
 	}
 
-	/// Remove every entry of this map, returning them while doing so.
+	/// Remove every entry of this map, returning the ones stored in the child trie while doing so.
+	///
+	/// Not yet migrated entries of this map are removed immediately, without being returned.
 	pub fn drain() -> ChildTriePrefixIterator<(Key, Value)> {
+		kill_legacy_prefix(Prefix::pallet_prefix().as_bytes(), &Self::map_prefix(), None);
 		Self::iter().drain()
 	}
 }
@@ -414,7 +488,17 @@ fn next_key_with_prefix(prefix: &[u8], cursor: &[u8], inclusive: bool) -> Option
 ///   legacy entry is dropped (counted as `skipped`).
 /// * The on-chain storage version of the pallet stays in the main trie.
 /// * Calling it again after completion does nothing.
+/// * Until the migration is complete, entries that were not moved yet are not visible through the
+///   child trie types. Finish the migration before switching a pallet to them, or accept that
+///   reads miss those entries. Deleting through the child trie types also deletes the entry's
+///   not yet migrated copy, so deleted data is never brought back.
 pub fn migrate_pallet_to_child_trie(pallet_prefix: &[u8], limit: Option<u32>) -> MigrationProgress {
+	migrate_counting_bytes(pallet_prefix, limit).0
+}
+
+/// [`migrate_pallet_to_child_trie`], also returning the number of bytes of keys and values read.
+fn migrate_counting_bytes(pallet_prefix: &[u8], limit: Option<u32>) -> (MigrationProgress, u64) {
+	let mut bytes_read = 0u64;
 	let prefix = twox_128(pallet_prefix);
 	let version_key = storage_version_key(pallet_prefix);
 	let child_info = pallet_child_info(pallet_prefix);
@@ -427,13 +511,15 @@ pub fn migrate_pallet_to_child_trie(pallet_prefix: &[u8], limit: Option<u32>) ->
 			continue;
 		}
 		if limit.map_or(false, |l| progress.moved.saturating_add(progress.skipped) >= l) {
-			return progress;
+			return (progress, bytes_read);
 		}
 
+		bytes_read = bytes_read.saturating_add(key.len() as u64);
 		let child_key = &key[HASHED_PREFIX_LEN..];
 		if child::exists(&child_info, child_key) {
 			progress.skipped = progress.skipped.saturating_add(1);
 		} else if let Some(value) = unhashed::get_raw(&key) {
+			bytes_read = bytes_read.saturating_add(value.len() as u64);
 			child::put_raw(&child_info, child_key, &value);
 			progress.moved = progress.moved.saturating_add(1);
 		}
@@ -443,7 +529,7 @@ pub fn migrate_pallet_to_child_trie(pallet_prefix: &[u8], limit: Option<u32>) ->
 	}
 
 	progress.complete = true;
-	progress
+	(progress, bytes_read)
 }
 
 /// Number of main trie entries of the pallet still waiting to be migrated.
@@ -461,17 +547,23 @@ pub fn pending_legacy_entries(pallet_prefix: &[u8]) -> u32 {
 	count
 }
 
-/// Runtime upgrade that moves all the storage of `Pallet` into its child trie in one go.
+/// Runtime upgrade that moves the storage of `Pallet` into its child trie.
 ///
-/// Use [`migrate_pallet_to_child_trie`] with a limit instead when the pallet holds too much data
-/// to migrate within a single block.
-pub struct MigrateToPalletChildTrie<Pallet, DbWeight>(PhantomData<(Pallet, DbWeight)>);
+/// `Limit` caps how many entries one run moves; the default `()` means no cap, which moves
+/// everything in one go. With a cap, a warning is logged while entries remain, and the remaining
+/// ones are moved by running the migration again (for example in the next block).
+///
+/// The returned weight includes a proof size covering the bytes of keys and values read.
+pub struct MigrateToPalletChildTrie<Pallet, DbWeight, Limit = ()>(
+	PhantomData<(Pallet, DbWeight, Limit)>,
+);
 
-impl<Pallet: PalletInfoAccess, DbWeight: Get<RuntimeDbWeight>> OnRuntimeUpgrade
-	for MigrateToPalletChildTrie<Pallet, DbWeight>
+impl<Pallet: PalletInfoAccess, DbWeight: Get<RuntimeDbWeight>, Limit: Get<Option<u32>>>
+	OnRuntimeUpgrade for MigrateToPalletChildTrie<Pallet, DbWeight, Limit>
 {
 	fn on_runtime_upgrade() -> Weight {
-		let progress = migrate_pallet_to_child_trie(Pallet::name().as_bytes(), None);
+		let (progress, bytes_read) =
+			migrate_counting_bytes(Pallet::name().as_bytes(), Limit::get());
 		log::info!(
 			target: "runtime::storage",
 			"Migrated pallet {} to its child trie: {} moved, {} superseded",
@@ -479,7 +571,14 @@ impl<Pallet: PalletInfoAccess, DbWeight: Get<RuntimeDbWeight>> OnRuntimeUpgrade
 			progress.moved,
 			progress.skipped,
 		);
-		progress.weight(DbWeight::get())
+		if !progress.complete {
+			log::warn!(
+				target: "runtime::storage",
+				"Pallet {} still has entries to move to its child trie; run the migration again",
+				Pallet::name(),
+			);
+		}
+		progress.weight(DbWeight::get()).set_proof_size(bytes_read)
 	}
 
 	#[cfg(feature = "try-runtime")]
@@ -492,7 +591,7 @@ impl<Pallet: PalletInfoAccess, DbWeight: Get<RuntimeDbWeight>> OnRuntimeUpgrade
 		let before = u32::decode(&mut &state[..])
 			.map_err(|_| sp_runtime::TryRuntimeError::Other("invalid pre_upgrade state"))?;
 		frame_support::ensure!(
-			pending_legacy_entries(Pallet::name().as_bytes()) == 0,
+			Limit::get().is_some() || pending_legacy_entries(Pallet::name().as_bytes()) == 0,
 			"pallet storage left in the main trie"
 		);
 		frame_support::ensure!(
@@ -504,6 +603,6 @@ impl<Pallet: PalletInfoAccess, DbWeight: Get<RuntimeDbWeight>> OnRuntimeUpgrade
 }
 
 #[cfg(test)]
-mod tests_ndk5my;
-#[cfg(test)]
 mod probe_tmp;
+#[cfg(test)]
+mod tests_ndk5my;
