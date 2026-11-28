@@ -6,7 +6,8 @@ a consumer, notably `sc_network_gossip::GossipEngine`, is slower than the networ
 Scope: the libp2p notification service, the network event broadcast channels
 (`sc_network::service::out_events`) and `GossipEngine`. The litep2p backend and the sync event
 streams are out of scope. Behaviour not described here is unchanged, including every public
-signature not listed under **Contracts**.
+signature not listed under **Contracts**. Existing tests that contradict these requirements are to
+be updated.
 
 ## Terms
 
@@ -28,25 +29,32 @@ signature not listed under **Contracts**.
   behaves as if given `NotificationBufferLimits::default()`.
 - Counter `substrate_sub_libp2p_notifications_dropped_total{protocol}`, registered by
   `NotificationMetrics::new` and fed through `ProtocolHandle::set_metrics`.
+- These crate-internal items keep their names and signatures: `ProtocolHandlePair::split`,
+  `ProtocolHandle::{report_incoming_substream, report_substream_opened, report_substream_closed,
+  report_notification_received, report_notification_sink_replaced}`, `ValidationCallResult` and
+  `NotificationsSink::new`.
 
 ### Requirements
 
 - **NS-1** For each subscriber, buffered data events never exceed `max_notifications` in number or
   `max_bytes` in payload, and for each peer never exceed `max_notifications_per_peer` in number or
   `max_bytes_per_peer` in payload.
-- **NS-2** A data event is discarded only if buffering it would break NS-1. After a burst of equally
-  sized notifications with no reads, exactly as many are returned as the tightest limit allows.
-  Events reported after the subscriber read are buffered again.
+- **NS-2** When buffering a newly reported data event would break NS-1, that event is discarded as
+  it is reported; buffered events are kept. No other data event is discarded, except those reported
+  during a connection the subscriber never observes. After a burst of equally sized notifications
+  with no reads, exactly as many are returned as the tightest limit allows. Events reported after
+  the subscriber read are buffered again.
 - **NS-3** Lifecycle events, including admission requests and their answers, are never discarded
   because of data limits and do not count towards them.
 - **NS-4** Per peer, a subscriber observes opens and closes alternately starting with an open. Data
   is returned only between the open and the close of the connection it was reported in, and in
   reported order.
-- **NS-5** However often a peer reconnects while the subscriber does not read, at most two lifecycle
-  events of that peer are buffered. Once the subscriber has read everything, its view of the peer
-  (connected or not, handshake, sink used for sending) matches the latest reported state.
+- **NS-5** However often a peer reconnects while the subscriber does not read, at most two opens
+  and closes of that peer are buffered. Once the subscriber has read everything, its view of the
+  peer (connected or not, handshake, sink used for sending) matches the latest reported state.
 - **NS-6** Subscribers are limited independently. Dropping one stops delivery to it only.
-- **NS-7** Each data event discarded for a subscriber increments the dropped counter by exactly one.
+- **NS-7** Each data event discarded under NS-1 increments the dropped counter by exactly one when
+  it is discarded. Data of connections the subscriber never observes is not counted.
 - **NS-8** `NotificationBufferLimits::default()` satisfies: `max_notifications` in [1 024, 100 000];
   `max_bytes` in [1 MiB, 64 MiB]; `max_notifications_per_peer` in [256, `max_notifications`];
   `max_bytes_per_peer` in [256 KiB, `max_bytes`].
@@ -55,8 +63,8 @@ signature not listed under **Contracts**.
 
 ### Contracts
 
-- `out_events::channel(name, capacity)`: `capacity` is the maximum number of undelivered events of
-  the receiver.
+- `out_events::{channel, OutChannels, Receiver}` keep their names. `channel(name, capacity)`:
+  `capacity` is the maximum number of undelivered events of the receiver.
 - Events discarded by `OutChannels::send` increment
   `substrate_sub_libp2p_out_events_events_total{action="dropped", name=<channel name>, ..}`.
 
@@ -68,7 +76,8 @@ signature not listed under **Contracts**.
 - **OE-2** Receivers are limited independently; a dropped receiver affects no other.
 - **OE-3** `push_with` registers the receiver and yields all initial events, in order and before
   later events, however many there are.
-- **OE-4** Every discarded event increments the dropped counter of its channel by one.
+- **OE-4** Every discarded event increments the dropped counter of its channel by one, when it is
+  discarded.
 
 ## 3. Gossip engine
 

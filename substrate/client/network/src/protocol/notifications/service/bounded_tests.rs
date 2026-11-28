@@ -18,12 +18,23 @@
 
 //! Behaviour tests for bounded delivery of notification events to protocol subscribers.
 
-use super::*;
-use crate::protocol::notifications::handler::NotificationsSinkMessage;
+use super::{
+	notification_service, notification_service_with_limits, NotificationBufferLimits,
+	ProtocolHandle, ProtocolHandlePair, ValidationCallResult,
+};
+use crate::{
+	protocol::notifications::handler::{NotificationsSink, NotificationsSinkMessage},
+	service::{
+		metrics::NotificationMetrics,
+		traits::{Direction, NotificationEvent, NotificationService, ValidationResult},
+	},
+};
 
-use futures::{channel::mpsc as sink_channel, FutureExt, Stream, StreamExt};
+use futures::{channel::mpsc as sink_channel, FutureExt, StreamExt};
+use libp2p::PeerId;
 use prometheus_endpoint::Registry;
-use std::collections::HashMap;
+use std::{any::Any, collections::HashMap};
+use tokio::sync::oneshot;
 
 const PROTOCOL: &str = "/bounded-delivery/1";
 const DROPPED_METRIC: &str = "substrate_sub_libp2p_notifications_dropped_total";
@@ -118,10 +129,10 @@ enum Seen {
 impl Seen {
 	fn peer(&self) -> PeerId {
 		match self {
-			Seen::Validate { peer, .. }
-			| Seen::Opened { peer, .. }
-			| Seen::Closed { peer }
-			| Seen::Data { peer, .. } => *peer,
+			Seen::Validate { peer, .. } |
+			Seen::Opened { peer, .. } |
+			Seen::Closed { peer } |
+			Seen::Data { peer, .. } => *peer,
 		}
 	}
 
@@ -210,7 +221,7 @@ fn dropped_count(registry: &Registry) -> u64 {
 
 struct Harness {
 	producer: ProtocolHandle,
-	_commands: Box<dyn Stream<Item = NotificationCommand> + Send + Unpin>,
+	_commands: Box<dyn Any>,
 	subscriber: Box<dyn NotificationService>,
 	registry: Registry,
 }
@@ -229,7 +240,7 @@ impl Harness {
 		let registry = Registry::new();
 		let (mut producer, commands) = pair.split();
 		producer.set_metrics(NotificationMetrics::new(Some(&registry)));
-		Self { producer, _commands: commands, subscriber, registry }
+		Self { producer, _commands: Box::new(commands), subscriber, registry }
 	}
 
 	fn open(&mut self, peer: PeerId, handshake: Vec<u8>) -> SinkEnd {
@@ -368,6 +379,8 @@ fn one_peer_cannot_buffer_more_notifications_than_its_quota() {
 			h.data(polite, payload(2, 0, seq / 20, 16));
 		}
 	}
+	it_should("count discarded notifications as they arrive, before anything is read");
+	assert_eq!(h.dropped(), 90);
 	let events = drain(&mut h.subscriber);
 	let flooded = sequences(&data_of(&events, flooder));
 	let polite_seen = sequences(&data_of(&events, polite));
@@ -408,6 +421,8 @@ fn subscriber_never_buffers_more_notifications_than_its_total_limit() {
 			h.data(*peer, payload(tag as u8, 0, seq, 12));
 		}
 	}
+	it_should("count discarded notifications as they arrive, before anything is read");
+	assert_eq!(h.dropped(), 70);
 	let events = drain(&mut h.subscriber);
 
 	it_should("retain exactly as many notifications as the total limit allows");
@@ -433,6 +448,8 @@ fn byte_limits_bound_buffered_payload() {
 	for seq in 0..50u32 {
 		per_peer.data(peer, payload(1, 0, seq, 100));
 	}
+	it_should("count notifications beyond the peer's byte quota as they arrive");
+	assert_eq!(per_peer.dropped(), 40);
 	let events = drain(&mut per_peer.subscriber);
 	it_should("retain exactly as many notifications as fit in the peer's byte quota");
 	assert_eq!(data_of(&events, peer).len(), 10);
@@ -451,6 +468,8 @@ fn byte_limits_bound_buffered_payload() {
 			total.data(*peer, payload(tag as u8, 0, seq, 100));
 		}
 	}
+	it_should("count notifications beyond the subscriber's byte limit as they arrive");
+	assert_eq!(total.dropped(), 35);
 	let events = drain(&mut total.subscriber);
 	it_should("retain exactly as many notifications as fit in the subscriber's byte limit");
 	let retained: usize = peers.iter().map(|p| data_of(&events, *p).len()).sum();
@@ -468,6 +487,7 @@ fn variable_sized_notifications_fill_the_byte_limit_without_exceeding_it() {
 	for seq in 0..500u32 {
 		h.data(peer, payload(1, 0, seq, 9 + rng.below(292) as usize));
 	}
+	let dropped_before_reading = h.dropped();
 	let events = drain(&mut h.subscriber);
 	let retained = data_of(&events, peer);
 	let bytes: usize = retained.iter().map(Vec::len).sum();
@@ -481,6 +501,9 @@ fn variable_sized_notifications_fill_the_byte_limit_without_exceeding_it() {
 	it_should("keep retained notifications in order and count every discarded one");
 	assert!(strictly_increasing(&sequences(&retained)));
 	assert_eq!(retained.len() as u64 + h.dropped(), 500);
+
+	it_should("have counted every discarded notification before anything was read");
+	assert_eq!(dropped_before_reading, h.dropped());
 }
 
 #[test]
@@ -507,6 +530,8 @@ fn empty_notifications_are_limited_by_count() {
 	for _ in 0..100 {
 		h.data(peer, Vec::new());
 	}
+	it_should("count discarded empty notifications as they arrive");
+	assert_eq!(h.dropped(), 93);
 	let events = drain(&mut h.subscriber);
 
 	it_should("retain exactly the peer's notification count quota");
@@ -683,6 +708,9 @@ fn reconnect_churn_of_an_observed_peer_stays_bounded() {
 	assert_eq!(latest.as_mut().expect("set; qed").sent(), vec![vec![5]]);
 	assert!(previous.as_mut().expect("set; qed").sent().is_empty());
 	assert!(original.sent().is_empty());
+
+	it_should("not count notifications of connections that were never observed as discarded");
+	assert_eq!(h.dropped(), 0);
 }
 
 #[test]
@@ -713,6 +741,9 @@ fn reconnect_churn_ending_disconnected_leaves_the_peer_disconnected() {
 	assert!(h.subscriber.message_sink(&peer.into()).is_none());
 	h.send_to(peer, vec![5]);
 	assert!(latest.as_mut().expect("set; qed").sent().is_empty());
+
+	it_should("not count notifications of connections that were never observed as discarded");
+	assert_eq!(h.dropped(), 0);
 }
 
 #[test]
@@ -741,6 +772,9 @@ fn reconnect_churn_of_an_unobserved_peer_stays_bounded() {
 	it_should("send through the newest connection's sink");
 	h.send_to(peer, vec![1]);
 	assert_eq!(latest.sent(), vec![vec![1]]);
+
+	it_should("not count notifications of connections that were never observed as discarded");
+	assert_eq!(h.dropped(), 0);
 }
 
 #[test]
@@ -805,13 +839,18 @@ fn subscribers_are_bounded_independently_and_survive_overflow() {
 	it_should("count only the idle subscriber's discarded notifications");
 	assert_eq!(dropped_count(&registry), 90);
 
-	it_should("keep delivering to the idle subscriber after the other subscriber is dropped");
+	drain(&mut idle);
 	drop(reader);
-	for seq in 100..105u32 {
+	let mut after_drop = Vec::new();
+	for seq in 100..150u32 {
 		let _ = producer.report_notification_received(peer, payload(1, 0, seq, 16));
+		after_drop.extend(data_of(&drain(&mut idle), peer));
 	}
-	let events = drain(&mut idle);
-	assert_eq!(sequences(&data_of(&events, peer)), vec![100, 101, 102, 103, 104]);
+	it_should("keep delivering to the remaining subscriber after the other one is dropped");
+	assert_eq!(sequences(&after_drop), (100..150).collect::<Vec<_>>());
+
+	it_should("stop buffering for a dropped subscriber, so nothing is discarded for it");
+	assert_eq!(dropped_count(&registry), 90);
 }
 
 #[test]
@@ -855,6 +894,7 @@ fn default_limits_are_finite_and_usable() {
 	}
 	it_should("accept every report without waiting for the subscriber");
 	assert_eq!(reported, sent);
+	let dropped_before_reading = flood.dropped();
 	let events = drain(&mut flood.subscriber);
 	let expected = defaults
 		.max_notifications_per_peer
@@ -864,6 +904,7 @@ fn default_limits_are_finite_and_usable() {
 	it_should("retain exactly what the default limits allow from a flooding peer");
 	assert_eq!(data_of(&events, peer).len(), expected);
 	assert_eq!(flood.dropped(), sent as u64 - expected as u64);
+	assert_eq!(dropped_before_reading, flood.dropped());
 
 	let mut large = Harness::with_defaults();
 	let peer = PeerId::random();

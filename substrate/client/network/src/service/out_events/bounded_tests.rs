@@ -18,9 +18,10 @@
 
 //! Behaviour tests for bounded network event broadcast channels.
 
-use super::*;
+use super::{channel, OutChannels, Receiver};
+use crate::event::Event;
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use prometheus_endpoint::Registry;
 use sc_network_types::PeerId;
 
@@ -67,8 +68,8 @@ fn dropped(registry: &Registry, channel: &str) -> u64 {
 		.flat_map(|family| family.get_metric().iter())
 		.filter(|metric| {
 			let labels = metric.get_label();
-			labels.iter().any(|l| l.get_name() == "action" && l.get_value() == "dropped")
-				&& labels.iter().any(|l| l.get_name() == "name" && l.get_value() == channel)
+			labels.iter().any(|l| l.get_name() == "action" && l.get_value() == "dropped") &&
+				labels.iter().any(|l| l.get_name() == "name" && l.get_value() == channel)
 		})
 		.map(|metric| metric.get_counter().get_value() as u64)
 		.sum()
@@ -89,6 +90,8 @@ fn burst_beyond_capacity_keeps_exactly_capacity_events_in_order() {
 	for index in 0..100 {
 		channels.send(numbered(&ids, index));
 	}
+	it_should("count discarded events as they are broadcast, before anything is read");
+	assert_eq!(dropped(&registry, "bounded-idle"), 90);
 	let (seen, ended) = drain(&mut rx, &ids);
 
 	it_should("keep the listener's stream open");
@@ -177,8 +180,9 @@ fn listeners_are_bounded_independently() {
 
 #[test]
 fn dropped_listener_does_not_affect_others() {
-	scenario("one of two listeners goes away and broadcasting continues");
-	let mut channels = OutChannels::new(None).expect("no registry; qed");
+	scenario("one of two listeners goes away and broadcasting continues well beyond capacity");
+	let registry = Registry::new();
+	let mut channels = OutChannels::new(Some(&registry)).expect("fresh registry; qed");
 	let (gone_tx, gone) = channel("bounded-gone", 10);
 	let (kept_tx, mut kept) = channel("bounded-kept", 10);
 	channels.push(gone_tx);
@@ -200,6 +204,10 @@ fn dropped_listener_does_not_affect_others() {
 	assert_eq!(second.len(), 10);
 	assert!(strictly_increasing(&second));
 	assert!(second.iter().all(|index| (5..30).contains(index)));
+
+	it_should("stop holding events for the listener that went away");
+	assert_eq!(dropped(&registry, "bounded-gone"), 0);
+	assert_eq!(dropped(&registry, "bounded-kept"), 15);
 }
 
 #[test]

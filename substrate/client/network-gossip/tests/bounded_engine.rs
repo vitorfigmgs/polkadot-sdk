@@ -365,6 +365,7 @@ enum DriveError {
 	Finished,
 	PollTookTooMuch(usize),
 	Stalled { remaining: usize },
+	BusyLoop,
 	TooManyPolls { remaining: usize },
 	SubscriberEnded,
 }
@@ -436,8 +437,8 @@ impl Harness {
 	}
 
 	fn taken(&self) -> usize {
-		self.notifications_taken.load(Ordering::SeqCst)
-			+ self.shared.sync_taken.load(Ordering::SeqCst)
+		self.notifications_taken.load(Ordering::SeqCst) +
+			self.shared.sync_taken.load(Ordering::SeqCst)
 	}
 
 	fn remaining(&self) -> usize {
@@ -462,13 +463,16 @@ impl Harness {
 	}
 
 	/// Polls the engine, letting `readers` read after every poll, until every inbound event was
-	/// taken and the readers stop receiving messages.
+	/// taken and the readers stop receiving messages. Once there is nothing left to do, the engine
+	/// must stop scheduling itself.
 	fn drive(
 		&mut self,
 		readers: &mut [&mut Subscriber],
 		max_polls: usize,
 	) -> Result<(), DriveError> {
+		const QUIET_ROUNDS: usize = 5;
 		let mut quiet_rounds = 0;
+		let mut quiet_wakes = 0;
 		for _ in 0..max_polls {
 			let (result, took) = self.poll_once();
 			if result.is_ready() {
@@ -490,11 +494,17 @@ impl Harness {
 			}
 			if remaining == 0 && read == 0 {
 				quiet_rounds += 1;
-				if quiet_rounds >= 3 {
-					return Ok(());
+				// A timer may legitimately fire once; repeated wakes with nothing to do are a
+				// busy loop.
+				if self.woken() {
+					quiet_wakes += 1;
+				}
+				if quiet_rounds >= QUIET_ROUNDS {
+					return if quiet_wakes > 1 { Err(DriveError::BusyLoop) } else { Ok(()) };
 				}
 			} else {
 				quiet_rounds = 0;
+				quiet_wakes = 0;
 			}
 		}
 		Err(DriveError::TooManyPolls { remaining: self.remaining() })
@@ -556,6 +566,36 @@ fn a_single_poll_does_bounded_work_and_asks_to_be_polled_again() {
 	let outcome = h.drive(&mut [], 200_000);
 	assert!(outcome.is_ok(), "{outcome:?}");
 	assert_eq!(h.remaining(), 0);
+}
+
+#[test]
+fn sync_peer_floods_count_towards_the_poll_budget() {
+	scenario("five thousand sync peers connect at once");
+	let mut h = Harness::new(Arc::new(TopicValidator::default()));
+	let peers: Vec<PeerId> = (0..5_000).map(|_| PeerId::random()).collect();
+	for peer in &peers {
+		h.push_sync(SyncEvent::PeerConnected { peer_id: *peer, roles: Roles::FULL });
+	}
+
+	let (result, took) = h.poll_once();
+	it_should("take at most the per-poll budget of sync events in one poll");
+	assert!(took <= POLL_BUDGET, "one poll took {took} inbound events");
+
+	it_should("yield while sync events remain and ask to be polled again");
+	assert!(result.is_pending());
+	assert!(h.remaining() > 0);
+	assert!(h.woken());
+
+	let outcome = h.drive(&mut [], 200_000);
+	it_should("add every sync peer to the reserved set");
+	assert!(outcome.is_ok(), "{outcome:?}");
+	let added = h.shared.reserved_added.lock().expect("not poisoned; qed").clone();
+	let added_ids: HashSet<String> = added
+		.iter()
+		.filter_map(|addr| addr.rsplit('/').next().map(str::to_owned))
+		.collect();
+	assert_eq!(added.len(), peers.len());
+	assert!(peers.iter().all(|peer| added_ids.contains(&peer.to_base58())));
 }
 
 #[test]
