@@ -44,6 +44,9 @@ use std::{
 	task::{Context, Poll},
 };
 
+#[cfg(test)]
+mod bounded_tests;
+
 /// Log target for this file.
 pub const LOG_TARGET: &str = "sub-libp2p::out_events";
 
